@@ -1,40 +1,45 @@
 /*
- * Clock Divider/Multiplier for OAM Uncertainty
- * Arduino C++ Version
+ * CDX - Clean Clock Divider/Multiplier for OAM Uncertainty
  * 
- * Outputs: /1, /2, /4, /8, /16, /32, x2, x4
- * CV input: Clock signal + Reset (high voltage)
+ * Outputs: /2, /4, /8, /12, /16, x2, x3, x4
+ * Input: Clock/trigger signals only
  * 
- * Hardware: Raspberry Pi Pico (RP2040) in Uncertainty module
+ * Control: Gate length the length of the gates that are put out
+ * - Short gates (5-50ms) = Punchy, staccato divisions
+ * - Long gates (50-200ms) = Sustained, legato divisions
  */
 
-// Pin definitions for OAM Uncertainty
+// Pin definitions
 #define CV_INPUT_PIN 26
 const int GATE_PINS[8] = {27, 28, 29, 0, 3, 4, 2, 1};
-// Note: LEDs are connected to the same pins as gates, so they light up automatically
 
-// Timing constants
-const int GATE_LENGTH = 10;        // Gate pulse length in milliseconds (shorter for better timing)
-const int CLOCK_THRESHOLD = 820;   // ADC threshold for +1V clock detection (~1V in 0-3.3V range)
-const int RESET_THRESHOLD = 2730;  // ADC threshold for reset trigger (~2.2V)
-const int DEBOUNCE_TIME = 2;       // Debounce time in milliseconds
+// Configuration
+const int TRIGGER_THRESHOLD = 1000;   // Threshold for clock detection
+const int MIN_GATE_LENGTH = 5;        // Minimum output gate length
+const int MAX_GATE_LENGTH = 200;      // Maximum output gate length
+const int DEBOUNCE_TIME = 5;          // Debounce time in milliseconds
 
-// State variables
+// Division counters
 unsigned long division_counters[5] = {0, 0, 0, 0, 0}; // For /2, /4, /8, /12, /16
+
+// Gate timing
 unsigned long gate_timers[8] = {0, 0, 0, 0, 0, 0, 0, 0}; // When each gate should turn off
+
+// Clock detection and gate length measurement
+bool last_clock_state = false;
+bool trigger_active = false;
+unsigned long trigger_start_time = 0;
+unsigned long input_gate_length = MIN_GATE_LENGTH;
 unsigned long last_clock_time = 0;
 unsigned long clock_interval = 500; // Default interval (120 BPM)
-bool last_clock_state = false;
-bool last_reset_state = false;
 unsigned long last_debounce_time = 0;
 
 // Multiplication timing
 unsigned long x2_timer = 0;
-unsigned long x3_timers[2] = {0, 0}; // For the 2 extra pulses in x3
-unsigned long x4_timers[3] = {0, 0, 0}; // For the 3 extra pulses in x4
+unsigned long x3_timers[2] = {0, 0}; // For x3 multiplication
+unsigned long x4_timers[3] = {0, 0, 0}; // For x4 multiplication
 
 void setup() {
-  // Initialize serial for debugging
   Serial.begin(115200);
   
   // Set up pins
@@ -44,30 +49,21 @@ void setup() {
     digitalWrite(GATE_PINS[i], LOW);
   }
   
-  Serial.println("Clock Divider/Multiplier Started");
+  Serial.println("CDX Clock Divider/Multiplier");
   Serial.println("Outputs: /2, /4, /8, /12, /16, x2, x3, x4");
-  Serial.println("CV Input: Clock + Reset (high voltage)");
+  Serial.println("Input gate length controls output gate length");
 }
 
 void loop() {
   unsigned long current_time = millis();
-  
-  // Read CV input
   int cv_value = analogRead(CV_INPUT_PIN);
+  bool gate_high = cv_value > TRIGGER_THRESHOLD;
   
-  // Print CV value every 500ms for debugging
-  static unsigned long last_debug_time = 0;
-  if (current_time - last_debug_time > 500) {
-    Serial.print("CV ADC value: ");
-    Serial.println(cv_value);
-    last_debug_time = current_time;
-  }
-  
-  // Check for reset (high CV voltage)
-  checkReset(cv_value, current_time);
+  // Measure input gate length
+  measureGateLength(gate_high, current_time);
   
   // Detect clock edges
-  if (detectClockEdge(cv_value, current_time)) {
+  if (detectClockEdge(gate_high, current_time)) {
     processDivisions();
     setupMultiplications(current_time);
   }
@@ -78,23 +74,41 @@ void loop() {
   // Update gate timing (turn off gates when time expires)
   updateGateTiming(current_time);
   
-  // Small delay to prevent overwhelming the processor
   delayMicroseconds(100);
 }
 
-bool detectClockEdge(int cv_value, unsigned long current_time) {
-  bool clock_present = cv_value > CLOCK_THRESHOLD;
+void measureGateLength(bool gate_high, unsigned long current_time) {
+  if (gate_high && !trigger_active) {
+    // Gate just went high - start measuring
+    trigger_active = true;
+    trigger_start_time = current_time;
+  } else if (!gate_high && trigger_active) {
+    // Gate just went low - calculate length
+    trigger_active = false;
+    unsigned long measured_length = current_time - trigger_start_time;
+    
+    // Map measured length to output gate length
+    input_gate_length = constrain(measured_length, MIN_GATE_LENGTH, MAX_GATE_LENGTH);
+    
+    Serial.print("Input gate: ");
+    Serial.print(measured_length);
+    Serial.print("ms -> Output gates: ");
+    Serial.print(input_gate_length);
+    Serial.println("ms");
+  }
+}
+
+bool detectClockEdge(bool gate_high, unsigned long current_time) {
   
   // Detect rising edge with debouncing
-  if (clock_present && !last_clock_state && 
+  if (gate_high && !last_clock_state && 
       (current_time - last_debounce_time) > DEBOUNCE_TIME) {
     
     // Calculate clock interval
     if (last_clock_time > 0) {
       clock_interval = current_time - last_clock_time;
-      // Limit clock interval to reasonable range (30ms to 2000ms = 30-2000 BPM)
-      if (clock_interval < 30) clock_interval = 30;
-      if (clock_interval > 2000) clock_interval = 2000;
+      // Keep interval in reasonable range
+      clock_interval = constrain(clock_interval, 30, 2000);
     }
     
     last_clock_time = current_time;
@@ -103,51 +117,15 @@ bool detectClockEdge(int cv_value, unsigned long current_time) {
     
     // Debug output
     int bpm = (clock_interval > 0) ? (60000 / clock_interval) : 0;
-    Serial.print("Clock detected - ADC: ");
-    Serial.print(cv_value);
-    Serial.print(", BPM: ");
+    Serial.print("Clock - BPM: ");
     Serial.println(bpm);
     
     return true;
-  } else if (!clock_present) {
+  } else if (!gate_high) {
     last_clock_state = false;
   }
   
   return false;
-}
-
-void checkReset(int cv_value, unsigned long current_time) {
-  bool reset_present = cv_value > RESET_THRESHOLD;
-  
-  if (reset_present && !last_reset_state) {
-    resetAllCounters();
-    last_reset_state = true;
-    Serial.println("Reset triggered");
-  } else if (!reset_present) {
-    last_reset_state = false;
-  }
-}
-
-void resetAllCounters() {
-  // Reset all division counters
-  for (int i = 0; i < 5; i++) {
-    division_counters[i] = 0;
-  }
-  
-  // Turn off all gates immediately
-  for (int i = 0; i < 8; i++) {
-    digitalWrite(GATE_PINS[i], LOW);
-    gate_timers[i] = 0;
-  }
-  
-  // Reset multiplication timers
-  x2_timer = 0;
-  for (int i = 0; i < 2; i++) {
-    x3_timers[i] = 0;
-  }
-  for (int i = 0; i < 3; i++) {
-    x4_timers[i] = 0;
-  }
 }
 
 void processDivisions() {
@@ -188,16 +166,16 @@ void setupMultiplications(unsigned long current_time) {
     x2_timer = current_time + (clock_interval / 2);
   }
   
-  // x3 multiplication (Gate 6) - set up 2 additional pulses
-  if (clock_interval > 150) { // Only if clock isn't too fast
+  // x3 multiplication (Gate 6)
+  if (clock_interval > 150) {
     x3_timers[0] = current_time + (clock_interval / 3);     // 1/3
     x3_timers[1] = current_time + (2 * clock_interval / 3); // 2/3
   }
   
-  // x4 multiplication (Gate 7) - set up 3 additional pulses
-  if (clock_interval > 200) { // Only if clock isn't too fast
+  // x4 multiplication (Gate 7)
+  if (clock_interval > 200) {
     x4_timers[0] = current_time + (clock_interval / 4);     // 1/4
-    x4_timers[1] = current_time + (clock_interval / 2);     // 1/2  
+    x4_timers[1] = current_time + (clock_interval / 2);     // 1/2
     x4_timers[2] = current_time + (3 * clock_interval / 4); // 3/4
   }
 }
@@ -206,14 +184,14 @@ void handleMultiplications(unsigned long current_time) {
   // x2 multiplication (Gate 5)
   if (x2_timer > 0 && current_time >= x2_timer) {
     triggerGate(5);
-    x2_timer = 0; // Reset timer
+    x2_timer = 0;
   }
   
   // x3 multiplication (Gate 6)
   for (int i = 0; i < 2; i++) {
     if (x3_timers[i] > 0 && current_time >= x3_timers[i]) {
       triggerGate(6);
-      x3_timers[i] = 0; // Reset this timer
+      x3_timers[i] = 0;
     }
   }
   
@@ -221,7 +199,7 @@ void handleMultiplications(unsigned long current_time) {
   for (int i = 0; i < 3; i++) {
     if (x4_timers[i] > 0 && current_time >= x4_timers[i]) {
       triggerGate(7);
-      x4_timers[i] = 0; // Reset this timer
+      x4_timers[i] = 0;
     }
   }
 }
@@ -229,7 +207,7 @@ void handleMultiplications(unsigned long current_time) {
 void triggerGate(int gate_index) {
   if (gate_index < 8) {
     digitalWrite(GATE_PINS[gate_index], HIGH);
-    gate_timers[gate_index] = millis() + GATE_LENGTH;
+    gate_timers[gate_index] = millis() + input_gate_length; // Use measured input gate length
   }
 }
 

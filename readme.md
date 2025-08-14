@@ -6,4 +6,5 @@ My collection of custom firmwares for the super cool [Olivia Artz Modular Uncert
 
 | Firmware | Description | Language |
 |----------|-------------|----------|
-| [clock-divider-multiplier](./clock-divider-multiplier/) | Clock divider/multiplier with ratios: /2, /4, /8, /12, /16, x2, x3, x4 | C++ |
+| [cdx - clock-divider-multiplier](./cdx_v1.0/) | clock divider/multiplier | C++ |
+| [burstainty - burst generator](./burstainty_v1.0/) | probalistic burst generator | C++ |
